@@ -394,8 +394,6 @@ def process_image(image_path: str, checkpoint_path: str, debug_root: str, instru
 
     # 2) Convert to nodes.json
     nodes = dets_to_nodes_json(dets, id_to_name)
-    # Remove nodes labeled "scan"
-    nodes = [n for n in nodes if str(n.get('label', '')).lower() != 'scan']
     nodes_path = os.path.join(out_dir, 'nodes.initial.json')
     with open(nodes_path, 'w', encoding='utf-8') as f:
         json.dump(nodes, f, indent=2)
