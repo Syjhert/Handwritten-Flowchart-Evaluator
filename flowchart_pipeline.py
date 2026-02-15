@@ -61,17 +61,89 @@ def detect_boxes(model, device, image_path: str, score_thresh: float = 0.65) -> 
     return dets
 
 
-def save_bboxes_debug_image(image_path: str, dets: List[Tuple[np.ndarray, int, float]], id_to_name: Dict[int, str], out_path: str):
-    bgr = cv2.imread(image_path)
-    if bgr is None:
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    for box, label, score in dets:
-        x1, y1, x2, y2 = [int(v) for v in box]
-        name = id_to_name.get(int(label), str(int(label)))
-        cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(bgr, f"{name}:{score:.2f}", (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    cv2.imwrite(out_path, bgr)
+def is_arrow_detection(label: int, id_to_name: Dict[int, str]) -> bool:
+    """Check if a detection is an arrow based on its label name."""
+    name = id_to_name.get(label, str(label))
+    return name.lower().startswith('arrow') if isinstance(name, str) else False
+
+
+def is_box_contained(box1: np.ndarray, box2: np.ndarray, threshold: float = 0.80) -> bool:
+    """Check if at least threshold (default 80%) of box1's area is contained within box2."""
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Calculate intersection area
+    inter_x1 = max(x1_1, x1_2)
+    inter_y1 = max(y1_1, y1_2)
+    inter_x2 = min(x2_1, x2_2)
+    inter_y2 = min(y2_1, y2_2)
+    
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return False  # No intersection
+    
+    intersection_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    
+    if box1_area == 0:
+        return False
+    
+    # Check if intersection is at least threshold of box1's area
+    return (intersection_area / box1_area) >= threshold
+
+
+def filter_nested_non_arrows(dets: List[Tuple[np.ndarray, int, float]], 
+                             id_to_name: Dict[int, str]) -> List[Tuple[np.ndarray, int, float]]:
+    """Remove non-arrow detections that are at least 80% contained within another non-arrow detection.
+    Keeps the detection with higher confidence when one is nested inside another.
+    """
+    if len(dets) <= 1:
+        return dets
+    
+    # Separate arrow and non-arrow detections
+    arrow_dets = []
+    non_arrow_dets = []
+    
+    for det in dets:
+        box, label, score = det
+        if is_arrow_detection(label, id_to_name):
+            arrow_dets.append(det)
+        else:
+            non_arrow_dets.append(det)
+    
+    # Filter nested non-arrow detections
+    to_remove = set()
+    
+    for i, (box1, label1, score1) in enumerate(non_arrow_dets):
+        if i in to_remove:
+            continue
+        
+        for j, (box2, label2, score2) in enumerate(non_arrow_dets):
+            if i == j or j in to_remove:
+                continue
+            
+            # Check if box1 is contained in box2
+            if is_box_contained(box1, box2):
+                # Remove the one with lower confidence
+                if score1 < score2:
+                    to_remove.add(i)
+                else:
+                    to_remove.add(j)
+                break
+            
+            # Check if box2 is contained in box1
+            elif is_box_contained(box2, box1):
+                # Remove the one with lower confidence
+                if score1 < score2:
+                    to_remove.add(i)
+                    break
+                else:
+                    to_remove.add(j)
+    
+    # Build filtered list
+    filtered_non_arrow = [det for idx, det in enumerate(non_arrow_dets) if idx not in to_remove]
+    
+    # Combine filtered non-arrows with all arrows
+    return arrow_dets + filtered_non_arrow
 
 
 # --- Nodes JSON helpers ---
@@ -386,11 +458,11 @@ def process_image(image_path: str, checkpoint_path: str, debug_root: str, instru
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
-    # 1) Detect boxes and save debug drawing
+    # 1) Detect boxes
     dets = detect_boxes(model, device, image_path, score_thresh=0.65)
-    save_bboxes_debug_image(
-        image_path, dets, id_to_name, os.path.join(out_dir, 'bounding_boxes.jpg')
-    )
+    
+    # Filter nested non-arrow detections (remove lower confidence ones)
+    dets = filter_nested_non_arrows(dets, id_to_name)
 
     # 2) Convert to nodes.json
     nodes = dets_to_nodes_json(dets, id_to_name)
@@ -408,26 +480,7 @@ def process_image(image_path: str, checkpoint_path: str, debug_root: str, instru
     with open(nodes_conn_path, 'w', encoding='utf-8') as f:
         json.dump(nodes_connected, f, indent=2)
 
-    # 4) Crop nodes
-    bgr = cv2.imread(image_path)
-    crops_dir = os.path.join(out_dir, 'cropped')
-    os.makedirs(crops_dir, exist_ok=True)
-    for n in nodes_connected:
-        bb = n['bbox']
-        # Adjust crop inward to focus text and reduce shape borders
-        x1c, y1c, x2c, y2c = adjust_bbox_for_text(bb, n.get('type', ''))
-        # Clamp to image bounds
-        x1c, y1c = max(0, x1c), max(0, y1c)
-        x2c, y2c = min(bgr.shape[1], x2c), min(bgr.shape[0], y2c)
-        if x2c <= x1c or y2c <= y1c:
-            # Fallback to original bbox if adjustment collapses
-            x1c, y1c, x2c, y2c = bb['x1'], bb['y1'], bb['x2'], bb['y2']
-            x1c, y1c = max(0, x1c), max(0, y1c)
-            x2c, y2c = min(bgr.shape[1], x2c), min(bgr.shape[0], y2c)
-        crop = bgr[y1c:y2c, x1c:x2c]
-        cv2.imwrite(os.path.join(crops_dir, f"{n['id']}.png"), crop)
-
-    # 5) Extract text from all nodes using full image (single LLM call with context awareness)
+    # 4) Extract text from all nodes using full image (single LLM call with context awareness)
     print("[info] Extracting text from all nodes using full flowchart image...")
     # Load instructions for extraction context if available
     extraction_instructions = ""
@@ -464,13 +517,7 @@ def process_image(image_path: str, checkpoint_path: str, debug_root: str, instru
     with open(ocr_json_path, 'w', encoding='utf-8') as f:
         json.dump(nodes_connected, f, indent=2)
 
-    # 6) Save labeled image
-    labeled = draw_labeled_image(bgr, nodes_connected)
-    cv2.imwrite(os.path.join(out_dir, 'ocr_extracted.jpg'), labeled)
-    # Save connections visualization
-    conn_vis = draw_connections_image(bgr, nodes_connected)
-    cv2.imwrite(os.path.join(out_dir, 'connections.jpg'), conn_vis)
-    # Print summary
+    # 6) Print summary
     print("[summary] Extracted texts:")
     for n in nodes_connected:
         print(f"  id={n['id']}, label={n.get('label','')}, text='{n.get('text','')}'")
@@ -552,6 +599,7 @@ def infer_connections_geometry(nodes: List[Dict]) -> List[Dict]:
     - Sort by top y (bbox.y1).
     - For each node, consider ALL nodes below with horizontal overlap >= 0.3.
     - Select targets with smallest vertical gaps; include all within 1.5x of the minimal dy (to allow branches).
+    - Only decision/diamond nodes can have multiple outgoing connections; others get only the closest target.
     - Append to existing 'connecting_to' without duplicating.
     """
     # Sort by top y
@@ -563,6 +611,10 @@ def infer_connections_geometry(nodes: List[Dict]) -> List[Dict]:
         inter = max(0, min(ax2, bx2) - max(ax1, bx1))
         union = max(ax2, bx2) - min(ax1, bx1)
         return inter / union if union > 0 else 0.0
+    
+    def is_decision_node(node: Dict) -> bool:
+        node_type = (node.get('type') or node.get('label') or '').lower()
+        return 'diamond' in node_type or 'rhombus' in node_type or 'decision' in node_type
 
     for i, n in enumerate(nodes_sorted):
         n.setdefault('connecting_to', [])
@@ -578,32 +630,34 @@ def infer_connections_geometry(nodes: List[Dict]) -> List[Dict]:
         if not candidates:
             continue
         candidates.sort(key=lambda t: t[0])
-        min_dy = candidates[0][0]
-        threshold = 1.5 * min_dy
-        for dy, m in candidates:
-            if dy <= threshold:
-                tgt_id = m['id']
-                if tgt_id not in n['connecting_to'] and tgt_id != n['id']:
-                    n['connecting_to'].append(tgt_id)
-            else:
-                break
+        
+        # Decision nodes can have multiple connections; others get only the closest
+        if is_decision_node(n):
+            min_dy = candidates[0][0]
+            threshold = 1.5 * min_dy
+            for dy, m in candidates:
+                if dy <= threshold:
+                    tgt_id = m['id']
+                    if tgt_id not in n['connecting_to'] and tgt_id != n['id']:
+                        n['connecting_to'].append(tgt_id)
+                else:
+                    break
+        else:
+            # Non-decision nodes: only connect to the closest target
+            m = candidates[0][1]
+            tgt_id = m['id']
+            if tgt_id not in n['connecting_to'] and tgt_id != n['id']:
+                n['connecting_to'].append(tgt_id)
     return nodes_sorted
 
 
 def infer_connections_with_arrows(nodes: List[Dict]) -> List[Dict]:
     """Infer multiple connections using explicit arrow detections when available.
-    Approach:
-    - Identify arrow nodes (type startswith 'arrow'). For each arrow, determine direction
-      from its type (e.g., 'arrow_line_down', 'arrow_line_up', 'arrow_line_left', 'arrow_line_right').
-    - Compute arrow tail and head points:
-        down: tail at top-center, head at bottom-center
-        up: tail at bottom-center, head at top-center
-        left: tail at right-center, head at left-center
-        right: tail at left-center, head at right-center
-    - Find source node whose bbox contains or is nearest to tail; find target node for head.
-      Use padding and nearest distance if not contained.
-    - Add edge src -> tgt. Allow multiple edges per src.
-    - Remove arrow nodes and, for remaining nodes without any outgoing edge, apply geometric fallback.
+    Improved approach:
+    - Identify arrow nodes and determine direction
+    - Find source and target nodes considering flow direction
+    - Check for intermediate nodes between source and target
+    - Connect through intermediate nodes to avoid skipping components
     """
     def is_arrow(t: str) -> bool:
         return t.lower().startswith('arrow') if isinstance(t, str) else False
@@ -641,6 +695,130 @@ def infer_connections_with_arrows(nodes: List[Dict]) -> List[Dict]:
         cy = (y1 + y2) / 2.0
         return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
 
+    def is_in_direction(src_bb: Dict[str, int], tgt_bb: Dict[str, int], direction: str) -> bool:
+        """Check if target is in the correct direction relative to source."""
+        src_cx = (src_bb['x1'] + src_bb['x2']) / 2
+        src_cy = (src_bb['y1'] + src_bb['y2']) / 2
+        tgt_cx = (tgt_bb['x1'] + tgt_bb['x2']) / 2
+        tgt_cy = (tgt_bb['y1'] + tgt_bb['y2']) / 2
+        
+        if direction.endswith('down'):
+            return tgt_cy > src_cy  # Target below source
+        elif direction.endswith('up'):
+            return tgt_cy < src_cy  # Target above source
+        elif direction.endswith('right'):
+            return tgt_cx > src_cx  # Target right of source
+        elif direction.endswith('left'):
+            return tgt_cx < src_cx  # Target left of source
+        return True  # Default: allow any direction
+
+    def directional_distance(src_bb: Dict[str, int], tgt_bb: Dict[str, int], direction: str) -> float:
+        """Calculate distance considering flow direction (penalize wrong direction)."""
+        src_cx = (src_bb['x1'] + src_bb['x2']) / 2
+        src_cy = (src_bb['y1'] + src_bb['y2']) / 2
+        tgt_cx = (tgt_bb['x1'] + tgt_bb['x2']) / 2
+        tgt_cy = (tgt_bb['y1'] + tgt_bb['y2']) / 2
+        
+        dx = tgt_cx - src_cx
+        dy = tgt_cy - src_cy
+        
+        if direction.endswith('down'):
+            # Prefer nodes below, penalize if above
+            if dy < 0:
+                return float('inf')  # Wrong direction
+            return abs(dx) + dy  # Horizontal distance + vertical distance
+        elif direction.endswith('up'):
+            if dy > 0:
+                return float('inf')
+            return abs(dx) + abs(dy)
+        elif direction.endswith('right'):
+            if dx < 0:
+                return float('inf')
+            return abs(dy) + dx
+        elif direction.endswith('left'):
+            if dx > 0:
+                return float('inf')
+            return abs(dy) + abs(dx)
+        
+        # Default: Euclidean distance
+        return ((dx ** 2) + (dy ** 2)) ** 0.5
+
+    def find_intermediate_nodes(src: Dict, tgt: Dict, direction: str, all_elems: List[Dict]) -> List[Dict]:
+        """Find nodes that are between source and target in the flow direction."""
+        intermediate = []
+        src_bb = src['bbox']
+        tgt_bb = tgt['bbox']
+        
+        for node in all_elems:
+            if node['id'] == src['id'] or node['id'] == tgt['id']:
+                continue
+            node_bb = node['bbox']
+            
+            # Check if node is between source and target
+            if direction.endswith('down'):
+                # Node should be below source and above target
+                src_bottom = src_bb['y2']
+                tgt_top = tgt_bb['y1']
+                node_top = node_bb['y1']
+                node_bottom = node_bb['y2']
+                if src_bottom < node_top < tgt_top or src_bottom < node_bottom < tgt_top:
+                    # Check horizontal overlap
+                    src_cx = (src_bb['x1'] + src_bb['x2']) / 2
+                    tgt_cx = (tgt_bb['x1'] + tgt_bb['x2']) / 2
+                    node_cx = (node_bb['x1'] + node_bb['x2']) / 2
+                    if min(src_cx, tgt_cx) - 50 <= node_cx <= max(src_cx, tgt_cx) + 50:
+                        intermediate.append(node)
+            elif direction.endswith('up'):
+                src_top = src_bb['y1']
+                tgt_bottom = tgt_bb['y2']
+                node_top = node_bb['y1']
+                node_bottom = node_bb['y2']
+                if tgt_bottom < node_top < src_top or tgt_bottom < node_bottom < src_top:
+                    src_cx = (src_bb['x1'] + src_bb['x2']) / 2
+                    tgt_cx = (tgt_bb['x1'] + tgt_bb['x2']) / 2
+                    node_cx = (node_bb['x1'] + node_bb['x2']) / 2
+                    if min(src_cx, tgt_cx) - 50 <= node_cx <= max(src_cx, tgt_cx) + 50:
+                        intermediate.append(node)
+            elif direction.endswith('right'):
+                src_right = src_bb['x2']
+                tgt_left = tgt_bb['x1']
+                node_left = node_bb['x1']
+                node_right = node_bb['x2']
+                if src_right < node_left < tgt_left or src_right < node_right < tgt_left:
+                    src_cy = (src_bb['y1'] + src_bb['y2']) / 2
+                    tgt_cy = (tgt_bb['y1'] + tgt_bb['y2']) / 2
+                    node_cy = (node_bb['y1'] + node_bb['y2']) / 2
+                    if min(src_cy, tgt_cy) - 50 <= node_cy <= max(src_cy, tgt_cy) + 50:
+                        intermediate.append(node)
+            elif direction.endswith('left'):
+                src_left = src_bb['x1']
+                tgt_right = tgt_bb['x2']
+                node_left = node_bb['x1']
+                node_right = node_bb['x2']
+                if tgt_right < node_left < src_left or tgt_right < node_right < src_left:
+                    src_cy = (src_bb['y1'] + src_bb['y2']) / 2
+                    tgt_cy = (tgt_bb['y1'] + tgt_bb['y2']) / 2
+                    node_cy = (node_bb['y1'] + node_bb['y2']) / 2
+                    if min(src_cy, tgt_cy) - 50 <= node_cy <= max(src_cy, tgt_cy) + 50:
+                        intermediate.append(node)
+        
+        # Sort intermediate nodes by distance from source
+        intermediate.sort(key=lambda n: directional_distance(src_bb, n['bbox'], direction))
+        return intermediate
+
+    def is_decision_node(node: Dict) -> bool:
+        """Check if a node is a decision/diamond node."""
+        node_type = (node.get('type') or node.get('label') or '').lower()
+        return 'diamond' in node_type or 'rhombus' in node_type or 'decision' in node_type
+
+    def euclidean_distance(bb1: Dict[str, int], bb2: Dict[str, int]) -> float:
+        """Calculate Euclidean distance between two bounding boxes."""
+        cx1 = (bb1['x1'] + bb1['x2']) / 2.0
+        cy1 = (bb1['y1'] + bb1['y2']) / 2.0
+        cx2 = (bb2['x1'] + bb2['x2']) / 2.0
+        cy2 = (bb2['y1'] + bb2['y2']) / 2.0
+        return ((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) ** 0.5
+
     arrows = [n for n in nodes if is_arrow(n.get('type', ''))]
     elems = [n for n in nodes if not is_arrow(n.get('type', ''))]
 
@@ -655,6 +833,7 @@ def infer_connections_with_arrows(nodes: List[Dict]) -> List[Dict]:
         bb = a['bbox']
         direction = str(a.get('label', a.get('type', ''))).lower()
         tail, head = pts_for_arrow(bb, direction)
+        
         # Find source: containing tail, else nearest by center distance
         src_candidates = []
         for n in elems:
@@ -665,26 +844,91 @@ def infer_connections_with_arrows(nodes: List[Dict]) -> List[Dict]:
         src_candidates.sort(key=lambda t: t[0])
         src = src_candidates[0][1] if src_candidates else None
 
-        # Find target: containing head, else nearest
+        if not src:
+            continue
+
+        # Find target: containing head, else nearest in correct direction
         tgt_candidates = []
         for n in elems:
+            if n['id'] == src['id']:
+                continue
             if point_in_bbox(head, n['bbox'], pad=12):
-                tgt_candidates.append((0.0, n))
+                # Check if in correct direction
+                if is_in_direction(src['bbox'], n['bbox'], direction):
+                    tgt_candidates.append((0.0, n))
             else:
-                tgt_candidates.append((dist_to_bbox(head, n['bbox']), n))
+                # Use directional distance (penalizes wrong direction)
+                dir_dist = directional_distance(src['bbox'], n['bbox'], direction)
+                if dir_dist != float('inf'):
+                    tgt_candidates.append((dir_dist, n))
+        
+        if not tgt_candidates:
+            continue
+            
         tgt_candidates.sort(key=lambda t: t[0])
-        tgt = tgt_candidates[0][1] if tgt_candidates else None
+        tgt = tgt_candidates[0][1]
 
-        if src and tgt and src['id'] != tgt['id']:
-            # Add connection if not already present
+        if src['id'] == tgt['id']:
+            continue
+
+        # Check for intermediate nodes
+        intermediate = find_intermediate_nodes(src, tgt, direction, elems)
+        
+        if intermediate:
+            # Connect through intermediate nodes
+            current = src
+            for inter_node in intermediate:
+                ct = current['connecting_to']
+                if inter_node['id'] not in ct:
+                    ct.append(inter_node['id'])
+                current = inter_node
+            # Finally connect last intermediate to target
+            ct = current['connecting_to']
+            if tgt['id'] not in ct:
+                ct.append(tgt['id'])
+        else:
+            # Direct connection
             ct = src['connecting_to']
             if tgt['id'] not in ct:
                 ct.append(tgt['id'])
+
+    # Post-process: For non-decision nodes, keep only the closest connection
+    for node in elems:
+        connections = node.get('connecting_to', [])
+        if len(connections) > 1 and not is_decision_node(node):
+            # Find the closest target
+            node_bb = node['bbox']
+            target_distances = []
+            for tgt_id in connections:
+                if tgt_id in id_to_elem:
+                    tgt_node = id_to_elem[tgt_id]
+                    dist = euclidean_distance(node_bb, tgt_node['bbox'])
+                    target_distances.append((dist, tgt_id))
+            
+            # Sort by distance and keep only the closest
+            target_distances.sort(key=lambda t: t[0])
+            closest_id = target_distances[0][1]
+            node['connecting_to'] = [closest_id]
 
     # Fallback geometry adds multiple targets for nodes with no outgoing edges
     no_edge_nodes = [n for n in elems if not n.get('connecting_to')]
     if no_edge_nodes:
         elems = infer_connections_geometry(elems)
+        # Apply the same filtering to geometry-inferred connections
+        for node in elems:
+            connections = node.get('connecting_to', [])
+            if len(connections) > 1 and not is_decision_node(node):
+                node_bb = node['bbox']
+                target_distances = []
+                for tgt_id in connections:
+                    if tgt_id in id_to_elem:
+                        tgt_node = id_to_elem[tgt_id]
+                        dist = euclidean_distance(node_bb, tgt_node['bbox'])
+                        target_distances.append((dist, tgt_id))
+                if target_distances:
+                    target_distances.sort(key=lambda t: t[0])
+                    closest_id = target_distances[0][1]
+                    node['connecting_to'] = [closest_id]
     return elems
 
 

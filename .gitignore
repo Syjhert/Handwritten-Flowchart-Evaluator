@@ -13,4 +13,5 @@ wheels/
 # Folders
 debug
 test_cases
-models
+model
+output
