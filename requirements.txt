@@ -309,7 +309,7 @@ nvidia-nvshmem-cu12==3.3.20 ; platform_machine == 'x86_64' and sys_platform == '
 nvidia-nvtx-cu12==12.8.90 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f
     # via torch
-opencv-python==4.11.0.86 \
+opencv-python-headless==4.11.0.86 \
     --hash=sha256:03d60ccae62304860d232272e4a4fda93c39d595780cb40b161b310244b736a4 \
     --hash=sha256:085ad9b77c18853ea66283e98affefe2de8cc4c1f43eda4c100cf9b2721142ec \
     --hash=sha256:1b92ae2c8852208817e6776ba1ea0d6b1e0a1b5431e971a2a0ddd2a8cc398202 \
